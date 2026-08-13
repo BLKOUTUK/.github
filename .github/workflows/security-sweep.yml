@@ -1,0 +1,133 @@
+# BLKOUT estate security sweep — reusable workflow.
+# Called weekly + on PR by each repo's .github/workflows/security.yml.
+# Blocking: secrets (gitleaks), workflow audit (zizmor, high+).
+# Advisory: dependency vulns (osv-scanner; Dependabot alerts carry notification),
+#           static analysis (opengrep, ERROR severity).
+# Source of truth: this file. Tool versions pinned below — bump here, all repos follow.
+
+name: Security sweep (reusable)
+
+on:
+  workflow_call: {}
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  ZIZMOR_VERSION: "1.29.0"
+  OSV_VERSION: "v2.5.0"
+  OPENGREP_VERSION: "v1.27.0"
+
+jobs:
+  secrets:
+    name: Secrets (gitleaks, blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan working tree for secrets
+        run: |
+          curl -sSfL -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf gitleaks.tgz gitleaks
+          code=0
+          ./gitleaks dir . --redact --exit-code 2 --report-path gitleaks-report.json || code=$?
+          {
+            echo "## Secrets (gitleaks)"
+            if [ "$code" = "2" ]; then
+              n=$(jq 'length' gitleaks-report.json 2>/dev/null || echo "?")
+              echo "**$n finding(s) — values redacted. Files:**"
+              jq -r '.[] | "- `\(.File):\(.StartLine)` (\(.RuleID))"' gitleaks-report.json 2>/dev/null | sort -u
+            elif [ "$code" = "0" ]; then
+              echo "Clean."
+            else
+              echo "Scanner error (exit $code)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -f gitleaks-report.json
+          exit "$code"
+
+  workflow-audit:
+    name: Workflow audit (zizmor, blocking high+)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit GitHub Actions workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "## Workflow audit (zizmor, high+ blocks)" >> "$GITHUB_STEP_SUMMARY"
+          if [ ! -d .github/workflows ]; then
+            echo "No workflows to audit." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          pipx install "zizmor==${ZIZMOR_VERSION}"
+          code=0
+          zizmor --min-severity high .github/workflows/ | tee zizmor.out || code=$?
+          if [ "$code" = "0" ]; then
+            echo "Clean at high severity." >> "$GITHUB_STEP_SUMMARY"
+          else
+            { echo '```'; tail -60 zizmor.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$code"
+
+  deps:
+    name: Dependencies (osv-scanner, advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan lockfiles for known vulnerabilities
+        run: |
+          curl -sSfL -o osv-scanner "https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_linux_amd64"
+          chmod +x osv-scanner
+          code=0
+          ./osv-scanner scan source -r . > osv.out 2>&1 || code=$?
+          {
+            echo "## Dependencies (osv-scanner, advisory — Dependabot alerts notify)"
+            if [ "$code" = "0" ]; then
+              echo "Clean."
+            elif [ "$code" = "1" ]; then
+              echo "**Known vulnerabilities found:**"
+              echo '```'
+              tail -80 osv.out
+              echo '```'
+            else
+              echo "No scannable package sources, or scanner issue (exit $code)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$code"
+
+  sast:
+    name: Static analysis (opengrep, advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src
+      - uses: actions/checkout@v4
+        with:
+          repository: opengrep/opengrep-rules
+          path: rules
+      - name: Run opengrep (js/ts/python ERROR-severity rules)
+        run: |
+          curl -sSfL -o opengrep "https://github.com/opengrep/opengrep/releases/download/${OPENGREP_VERSION}/opengrep_manylinux_x86"
+          chmod +x opengrep
+          cd src
+          code=0
+          ../opengrep scan --severity ERROR \
+            --config ../rules/javascript --config ../rules/typescript --config ../rules/python \
+            --json -o ../opengrep.json || code=$?
+          n=$(jq '.results | length' ../opengrep.json 2>/dev/null || echo "?")
+          {
+            echo "## Static analysis (opengrep, advisory)"
+            if [ "$code" != "0" ]; then
+              echo "Scanner issue (exit $code)."
+            elif [ "$n" = "0" ]; then
+              echo "Clean at ERROR severity."
+            else
+              echo "**$n finding(s):**"
+              jq -r '.results[] | "- `\(.path):\(.start.line)` \(.check_id)"' ../opengrep.json | sort -u | head -40
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
