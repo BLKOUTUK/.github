@@ -27,8 +27,25 @@ jobs:
         run: |
           curl -sSfL -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
           tar -xzf gitleaks.tgz gitleaks
+          # Default rules plus ONE narrow allowlist. Supabase publishable keys are meant to ship in
+          # client code — RLS is the control, not secrecy — and they appear in every built bundle and
+          # static page we serve. Left unlisted they fired on every PR, which trained everyone to merge
+          # through a red blocking gate (two branches on 28 Aug 2026, one merged anyway). A gate that
+          # always cries wolf cannot flag a real leak.
+          # Deliberately NOT allowlisted: sb_secret_*, service_role JWTs, and every other rule.
+          cat > gitleaks-blkout.toml <<'TOML'
+          [extend]
+          useDefault = true
+
+          [[allowlists]]
+          description = "Supabase publishable keys are public by design (RLS is the control)"
+          regexTarget = "match"
+          regexes = [
+            '''sb_publishable_[A-Za-z0-9_-]{20,}''',
+          ]
+          TOML
           code=0
-          ./gitleaks dir . --redact --exit-code 2 --report-path gitleaks-report.json || code=$?
+          ./gitleaks dir . --redact --exit-code 2 --config gitleaks-blkout.toml --report-path gitleaks-report.json || code=$?
           {
             echo "## Secrets (gitleaks)"
             if [ "$code" = "2" ]; then
@@ -41,7 +58,7 @@ jobs:
               echo "Scanner error (exit $code)."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-          rm -f gitleaks-report.json
+          rm -f gitleaks-report.json gitleaks-blkout.toml
           exit "$code"
 
   workflow-audit:
